@@ -9,7 +9,7 @@ for line in args.log.read_text(encoding='utf8').splitlines():
  except ValueError:bad+=1;continue
  if not args.since<=d.get('epoch',0)<=args.until:continue
  if d.get('kind')=='http':
-  if d.get('path')=='wired' and d.get('probe_revision',1)<2:invalid_reference+=1;continue
+  if d.get('path')=='wired' and d.get('probe_revision',1)<3:invalid_reference+=1;continue
   groups[(d['path'],d['target'])].append(d)
  elif d.get('kind')=='host':hosts.append(d)
 def q(vals,p):

@@ -48,6 +48,8 @@ mkdir -p "/etc/netns/$ns";printf 'nameserver 172.31.255.1\n' > "/etc/netns/$ns/r
 # source-port range, below the automatic ephemeral pool; LAN policy is untouched.
 read -r first_port last_port < /proc/sys/net/ipv4/ip_local_port_range
 [ 25031 -lt "$first_port" ] || { echo 'Reference source ports overlap ephemeral pool' >&2;exit 1; }
+wan_ip="$(ip -4 addr show dev eth0 scope global | awk '/inet /{print $2;exit}' | cut -d/ -f1)"
+[ -n "$wan_ip" ] || exit 1
 nft delete table inet privacy_monitor_reference 2>/dev/null || true
 nft -f - <<'NFT'
 table inet privacy_monitor_reference {
@@ -73,7 +75,7 @@ for path in lan wired proxy;do
   set -- --silent --show-error --compressed --http2 --connect-timeout 4 --max-time 10 -L -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36' -e https://www.bilibili.com/ -o "$work/body" -w '%{json}' "$url"
   case "$path" in
    lan)ip netns exec "$ns" curl --noproxy '*' "$@" > "$work/metrics" 2>/dev/null || code=$?;;
-   wired)curl --interface eth0 --local-port 25000-25031 --noproxy '*' "$@" > "$work/metrics" 2>/dev/null || code=$?;;
+   wired)curl --interface "host!$wan_ip" --local-port 25000-25031 --noproxy '*' "$@" > "$work/metrics" 2>/dev/null || code=$?;;
    proxy)curl --config "$work/proxy.curl" --noproxy '' "$@" > "$work/metrics" 2>/dev/null || code=$?;;
   esac
   lua "$row" http "$work/metrics" "$now" "$path" "$target" "$code" "$work/body" >> "$state/log.jsonl"

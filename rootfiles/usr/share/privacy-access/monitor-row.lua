@@ -1,7 +1,7 @@
 local j=require('luci.jsonc');local fs=require('nixio.fs')
 local function read(p)return fs.readfile(p) or '' end
 if arg[1]=='http' then
- local raw=j.parse(read(arg[2])) or {};local d={kind='http',probe_revision=2,epoch=tonumber(arg[3]),path=arg[4],target=arg[5],exit=tonumber(arg[6])}
+ local raw=j.parse(read(arg[2])) or {};local d={kind='http',probe_revision=3,epoch=tonumber(arg[3]),path=arg[4],target=arg[5],exit=tonumber(arg[6])}
  for _,k in ipairs({'http_code','time_namelookup','time_connect','time_appconnect','time_starttransfer','time_total','size_download','http_version','ssl_verify_result'})do d[k]=raw[k] end
  local body=read(arg[7]);d.page_ok=d.exit==0 and tonumber(raw.http_code)==200
  if d.target=='bilibili' then d.page_ok=d.page_ok and #body>10000 and (body:find('bilibili',1,true)~=nil or body:find('哔哩',1,true)~=nil) end
