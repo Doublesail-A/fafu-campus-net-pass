@@ -1,0 +1,13 @@
+{
+  "luci-app-privacy-access": {
+    "description": "Manage MAC-based internet permissions",
+    "read": {
+      "ubus": { "file": ["exec"] },
+      "file": { "/usr/sbin/privacy-access-status": ["exec"] }
+    },
+    "write": {
+      "ubus": { "file": ["exec"] },
+      "file": { "/usr/sbin/privacy-access": ["exec"] }
+    }
+  }
+}

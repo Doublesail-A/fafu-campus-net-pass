@@ -1,0 +1,84 @@
+#!/bin/sh
+# Bounded 48-hour monitor; no browser cookies, no automatic node switching.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+state=/etc/privacy-latency-monitor
+row=/usr/share/privacy-access/monitor-row.lua
+mac='12:00:00:fe:ff:f4';addr='172.31.255.250'
+stop(){
+ /usr/sbin/privacy-access remove "$mac" >/dev/null 2>&1 || true
+ tmp="$(mktemp /tmp/privacy-monitor-cron.XXXXXX)"
+ sed '/# privacy-latency-monitor$/d' /etc/crontabs/root > "$tmp"
+ cat "$tmp" > /etc/crontabs/root;rm -f "$tmp"
+ /etc/init.d/cron reload >/dev/null 2>&1 || true
+ touch "$state/COMPLETE"
+}
+case "${1:-sample}" in
+ stop) stop;exit 0;;
+ sample) ;;
+ *)echo 'usage: privacy-latency-monitor [sample|stop]' >&2;exit 2;;
+esac
+[ -s "$state/end" ] || exit 0
+exec 8>/tmp/privacy-latency-monitor.lock
+flock -n 8 || exit 0
+now="$(date +%s)"
+if [ "$now" -ge "$(cat "$state/end")" ];then stop;exit 0;fi
+work="$(mktemp -d /tmp/privacy-monitor.XXXXXX)"
+ns="pm_$$";dev="pmh$$";peer="pmp$$"
+cleanup(){
+ nft delete table inet privacy_monitor_reference 2>/dev/null || true
+ ip link del "$dev" 2>/dev/null || true;ip netns del "$ns" 2>/dev/null || true
+ ip neigh del "$addr" dev br-lan 2>/dev/null || true
+ rm -f "/etc/netns/$ns/resolv.conf";rmdir "/etc/netns/$ns" 2>/dev/null || true
+ case "$work" in /tmp/privacy-monitor.?*)rm -rf "$work";;esac
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+if ip neigh show "$addr" dev br-lan | grep -q lladdr || ping -c 1 -W 1 "$addr" >/dev/null 2>&1;then
+ printf '{"kind":"error","epoch":%s,"reason":"probe_ip_occupied"}\n' "$now" >> "$state/log.jsonl";exit 1
+fi
+ip netns add "$ns";ip link add "$dev" type veth peer name "$peer";ip link set "$peer" netns "$ns"
+ip link set "$dev" master br-lan;ip link set "$dev" up
+ip -n "$ns" link set lo up;ip -n "$ns" link set "$peer" address "$mac";ip -n "$ns" addr add "$addr/24" dev "$peer";ip -n "$ns" link set "$peer" up;ip -n "$ns" route add default via 172.31.255.1
+mkdir -p "/etc/netns/$ns";printf 'nameserver 172.31.255.1\n' > "/etc/netns/$ns/resolv.conf"
+# A bound eth0 socket cannot receive replies redirected through loopback UA3F.
+# The reference is deliberately router-originated. Mark only its reserved low
+# source-port range, below the automatic ephemeral pool; LAN policy is untouched.
+read -r first_port last_port < /proc/sys/net/ipv4/ip_local_port_range
+[ 25031 -lt "$first_port" ] || { echo 'Reference source ports overlap ephemeral pool' >&2;exit 1; }
+nft delete table inet privacy_monitor_reference 2>/dev/null || true
+nft -f - <<'NFT'
+table inet privacy_monitor_reference {
+ chain output {
+  type route hook output priority -121; policy accept;
+  oifname "eth0" meta skuid 0 tcp sport 25000-25031 tcp dport { 80, 443 } meta mark 0 meta mark set 201
+ }
+}
+NFT
+lua - "$work/proxy.curl" <<'LUA'
+local fs=require('nixio.fs');local secret=assert(fs.readfile('/etc/privacy-proxy/api.secret')):gsub('%s','')
+assert(secret:match('^%x+$'));assert(fs.writefile(arg[1],'proxy = "http://127.0.0.1:7896"\nproxy-user = "default:'..secret..'"\n'))
+fs.chmod(arg[1],'600')
+assert(fs.writefile(arg[1]..'.api','header = "Authorization: Bearer '..secret..'"\n'));fs.chmod(arg[1]..'.api','600')
+LUA
+curl --config "$work/proxy.curl.api" --noproxy '*' -s --max-time 2 http://127.0.0.1:9091/proxies/privacy-select > "$work/selector" || true
+curl --config "$work/proxy.curl.api" --noproxy '*' -s --max-time 2 http://127.0.0.1:9091/proxies/privacy-auto > "$work/auto" || true
+lua "$row" host "$now" "$work/selector" "$work/auto" >> "$state/log.jsonl"
+for path in lan wired proxy;do
+ while IFS=' ' read -r target url;do
+  [ -n "$url" ] || continue
+  code=0
+  set -- --silent --show-error --compressed --http2 --connect-timeout 4 --max-time 10 -L -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36' -e https://www.bilibili.com/ -o "$work/body" -w '%{json}' "$url"
+  case "$path" in
+   lan)ip netns exec "$ns" curl --noproxy '*' "$@" > "$work/metrics" 2>/dev/null || code=$?;;
+   wired)curl --interface eth0 --local-port 25000-25031 --noproxy '*' "$@" > "$work/metrics" 2>/dev/null || code=$?;;
+   proxy)curl --config "$work/proxy.curl" --noproxy '' "$@" > "$work/metrics" 2>/dev/null || code=$?;;
+  esac
+  lua "$row" http "$work/metrics" "$now" "$path" "$target" "$code" "$work/body" >> "$state/log.jsonl"
+ done < "$state/targets"
+done
+lua "$row" host "$(date +%s)" "$work/selector" "$work/auto" >> "$state/log.jsonl"
+# Logs stay bounded even if manually restarted repeatedly.
+if [ "$(wc -c < "$state/log.jsonl")" -gt 8388608 ];then mv "$state/log.jsonl" "$state/log.previous.jsonl";fi

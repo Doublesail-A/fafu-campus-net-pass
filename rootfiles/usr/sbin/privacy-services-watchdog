@@ -1,0 +1,8 @@
+#!/bin/sh
+[ ! -e /tmp/privacy-transport-maintenance ] || exit 0
+pidof ua3f >/dev/null || /etc/init.d/ua3f start
+pidof squid >/dev/null || /etc/init.d/privacy-squid start
+pgrep -f 'sing-box run -c /etc/sing-box/privacy-iot.json' >/dev/null || /etc/init.d/iot-proxy start
+pgrep -f 'sing-box run -c /etc/sing-box/privacy-doh.json' >/dev/null || /etc/init.d/privacy-doh start
+nft list table inet privacy_policy >/dev/null 2>&1 || /etc/init.d/privacy-policy start
+/etc/init.d/privacy-relay-compat start

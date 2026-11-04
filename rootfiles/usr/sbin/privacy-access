@@ -1,0 +1,250 @@
+#!/bin/sh
+# The installed RPC entry point must not accept file/command overrides from
+# file.exec's environment argument. Isolated tests run the staged copy.
+case "$0" in
+    /usr/sbin/privacy-access)
+        unset UCI_CONFIG_DIR PA_LIBRARY PA_CLASSIFIER PA_LEASES PA_MANUAL_IOT PA_CERT_IPS PA_CERT_MACS PA_TEMPLATE PA_DISCOVERY PA_DISCOVERY_FIXTURE PA_POLICY_TABLE PA_IOT_TABLE PA_MITM_TABLE PA_LOCK PA_WRITE_LOCK
+        unset PA_REG_LIBRARY PA_REG_SECRET PA_REG_LAST PA_REG_RUNTIME PA_REG_LOCK PA_TEMP_PROXY_FILE
+        PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+        export PATH
+        ;;
+esac
+. "${PA_LIBRARY:-/usr/share/privacy-access/common.sh}"
+. /usr/share/libubox/jshn.sh
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+usage() {
+    printf '%s\n' 'privacy-access list | add MAC [REMARK] [GROUP=normal] [ENABLED=1] [HOSTNAME] [OWNER] | remove MAC | reload'
+}
+json_ips() {
+    local key="$1" ips="$2" ip
+    json_add_array "$key"
+    for ip in $ips; do json_add_string '' "$ip"; done
+    json_close_array
+}
+json_client() {
+    local mac="$1" section="${2:-}" name='' owner='' enabled='0' group='normal' hostname='' ips='' connected='0' source='-' row configured='0' cached=''
+    if [ -n "$section" ]; then
+        configured=1
+        config_get name "$section" name ''
+        config_get enabled "$section" enabled '1'
+        config_get group "$section" group 'normal'
+        config_get cached "$section" hostname ''
+        config_get owner "$section" owner ''
+    fi
+    row="$(awk -F '\t' -v mac="$mac" '$1==mac {print;exit}' "$status_dir/inventory")"
+    if [ -n "$row" ]; then
+        IFS="$(printf '\t')" read -r mac ips hostname connected source <<ROW
+$row
+ROW
+    fi
+    [ "$ips" != '-' ] || ips=''
+    [ "$hostname" != '*' ] || hostname=''
+    [ -n "$hostname" ] || hostname="$cached"
+    json_add_object ''
+    json_add_string mac "$mac"
+    json_add_string name "$name"
+    json_add_string remark "$name"
+    json_add_string hostname "$hostname"
+    json_add_string owner "$owner"
+    json_add_boolean enabled "$enabled"
+    json_add_boolean configured "$configured"
+    json_add_boolean connected "$connected"
+    json_add_string connection "$source"
+    json_add_string group "$group"
+    if pa_contains "$live_macs" "$mac"; then json_add_boolean allowed '1'; else json_add_boolean allowed '0'; fi
+    ips="$(printf '%s' "$ips" | tr ',' ' ')"
+    json_ips ips "$ips"
+    json_close_object
+}
+json_device() {
+    local section="$1" mac
+    config_get mac "$section" mac
+    json_client "$(pa_normalize_mac "$mac")" "$section"
+}
+list_status() {
+    local live_macs='' policy_running='0' expiry mac ip hostname allowed group pending
+    pa_load_access || die 'MAC whitelist configuration is invalid'
+    nft list set inet "$PA_POLICY_TABLE" allowed_macs >/dev/null 2>&1 && policy_running='1'
+    live_macs="$(pa_nft_macs "$PA_POLICY_TABLE" allowed_macs)"
+    . "$PA_DISCOVERY"
+    pa_build_inventory "$status_dir"
+    json_init
+    json_add_boolean policy_running "$policy_running"
+    if grep -qx 'tls-passthrough-v1' /etc/privacy-transport-mode 2>/dev/null; then
+        json_add_string tls_mode passthrough; json_add_boolean ca_required 0
+    else
+        json_add_string tls_mode mitm; json_add_boolean ca_required 1
+    fi
+    json_add_array devices
+    config_foreach json_device device
+    json_close_array
+    json_add_array owners
+    config_list_foreach main owners json_owner
+    json_close_array
+    json_add_array unregistered
+    while IFS="$(printf '\t')" read -r mac ip hostname connected source; do
+        [ "$connected" = '1' ] || continue
+        pa_valid_mac "$mac" || continue
+        pa_contains "$PA_CONFIGURED_MACS" "$mac" && continue
+        json_client "$mac"
+    done < "$status_dir/inventory"
+    json_close_array
+    json_add_array leases
+    pa_active_leases > "$status_dir/leases"
+    while read -r expiry mac ip hostname; do
+        [ -n "$ip" ] || continue
+        allowed='0'; group='blocked'
+        if pa_contains "$live_macs" "$mac"; then
+            allowed='1'; group='normal'
+            pa_contains "$PA_IOT_MACS" "$mac" && group='iot'
+        fi
+        json_add_object ''
+        json_add_string mac "$mac"
+        json_add_string ip "$ip"
+        json_add_string hostname "$hostname"
+        json_add_boolean allowed "$allowed"
+        json_add_string group "$group"
+        json_close_object
+    done < "$status_dir/leases"
+    json_close_array
+    config_get pending main migration_pending ''
+    json_add_string migration_pending "$pending"
+    json_dump
+}
+
+json_owner() { json_add_string '' "$1"; }
+
+case "$1" in
+    people-add|people-rename|people-remove|people-move)
+        umask 077
+        exec 8>>"${PA_WRITE_LOCK:-/tmp/privacy-access-write.lock}"
+        flock -x 8 || exit 1
+        exec 7>>"${PA_LOCK:-/tmp/privacy-classify.lock}"
+        flock -x 7 || exit 1
+        exec /usr/bin/env -i PATH="$PATH" /usr/bin/lua "$(dirname "${PA_LIBRARY:-/usr/share/privacy-access/common.sh}")/people.lua" "$PA_CONFIG_DIR" "$@"
+        ;;
+    registration-status|registration-enable|registration-reset)
+        . "$PA_REG_LIBRARY"
+        pa_reg_admin "$@"
+        exit $?
+        ;;
+    list)
+        [ "$#" -eq 1 ] || die 'Unexpected arguments'
+        status_dir="$(mktemp -d /tmp/privacy-access-status.XXXXXX)" || exit 1
+        trap 'rm -f "$status_dir/events" "$status_dir/ports" "$status_dir/inventory" "$status_dir/leases"; rmdir "$status_dir"' EXIT
+        list_status
+        exit $?
+        ;;
+    add|remove|reload) action="$1"; shift ;;
+    *) usage; exit 1 ;;
+esac
+
+if [ "$action" != 'reload' ]; then
+    mac="$(pa_normalize_mac "$1")"
+    pa_valid_mac "$mac" || die 'Invalid unicast MAC address'
+    section="mac_$(printf '%s' "$mac" | tr -d ':')"
+fi
+if [ "$action" = 'add' ]; then
+    [ "$#" -ge 1 ] && [ "$#" -le 6 ] || die 'Unexpected arguments'
+    name="${2:-}"
+    group="${3:-normal}"
+    enabled="${4:-1}"
+    hostname="${5:-}"
+    owner="${6:-}"
+    owner_given=0
+    [ "$#" -lt 6 ] || owner_given=1
+    [ "${#owner}" -le 80 ] || die 'Owner must be at most 80 characters'
+    [ "$(printf '%s' "$owner" | LC_ALL=C tr -d '[:cntrl:]')" = "$owner" ] || die 'Owner cannot contain control characters'
+    [ "${#name}" -le 80 ] || die 'Device name must be at most 80 characters'
+    case "$name" in *"
+"*|*"$(printf '\r')"*) die 'Device name cannot contain line breaks' ;; esac
+    case "$group:$enabled" in normal:0|normal:1|iot:0|iot:1) ;; *) die 'Group must be normal or iot; enabled must be 0 or 1' ;; esac
+    [ "${#hostname}" -le 80 ] || die 'Hostname must be at most 80 characters'
+    case "$hostname" in *"
+"*|*"$(printf '\r')"*) die 'Hostname cannot contain line breaks' ;; esac
+elif [ "$action" = 'remove' ]; then
+    [ "$#" -eq 1 ] || die 'Unexpected arguments'
+else
+    [ "$#" -eq 0 ] || die 'Unexpected arguments'
+fi
+
+write_lock="${PA_WRITE_LOCK:-/tmp/privacy-access-write.lock}"
+umask 077
+exec 8>>"$write_lock"
+flock -x 8 || exit 1
+classify_lock="${PA_LOCK:-/tmp/privacy-classify.lock}"
+classify_locked=0
+backup=''
+cleanup() {
+    [ -z "$backup" ] || rm -f "$backup"
+    [ "$classify_locked" = '0' ] || flock -u 7
+    flock -u 8
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+# DHCP hotplug must never read partly staged UCI deltas (especially enabled=0).
+exec 7>>"$classify_lock"
+flock -x 7 || exit 1
+classify_locked=1
+find_matching_section() {
+    local candidate="$1" candidate_mac cached
+    config_get candidate_mac "$candidate" mac
+    [ "$(pa_normalize_mac "$candidate_mac")" = "$mac" ] || return 0
+    matches="$matches $candidate"
+    if [ "$action" = 'add' ] && [ -z "$hostname" ]; then
+        config_get cached "$candidate" hostname ''
+        [ -z "$cached" ] || hostname="$cached"
+    fi
+    if [ "$action" = 'add' ] && [ "$owner_given" = 0 ] && [ -z "$owner" ]; then
+        config_get owner "$candidate" owner ''
+    fi
+}
+if [ "$action" != 'reload' ]; then
+    [ -f "$PA_CONFIG_DIR/privacy_access" ] || die 'privacy_access configuration is missing'
+    backup="$(mktemp /tmp/privacy-access-config.XXXXXX)" || exit 1
+    cp -p "$PA_CONFIG_DIR/privacy_access" "$backup" || exit 1
+    matches=''
+    config_load privacy_access || die 'Unable to read MAC permissions'
+    config_foreach find_matching_section device
+    if [ "$action" = 'remove' ] && [ -z "$matches" ]; then die 'MAC permission was not found'; fi
+    # Replace every record with this MAC, including noncanonical legacy sections.
+    for matched in $matches; do
+        uci -q -c "$PA_CONFIG_DIR" delete "privacy_access.$matched" || {
+            uci -q -c "$PA_CONFIG_DIR" revert privacy_access
+            die 'Unable to replace existing MAC permission'
+        }
+    done
+    if [ "$action" = 'add' ]; then
+        discovered="$(pa_mac_hostname "$mac")"
+        [ -z "$discovered" ] || hostname="$discovered"
+        uci -q -c "$PA_CONFIG_DIR" set "privacy_access.$section=device" &&
+        uci -q -c "$PA_CONFIG_DIR" set "privacy_access.$section.mac=$mac" &&
+        uci -q -c "$PA_CONFIG_DIR" set "privacy_access.$section.name=$name" &&
+        uci -q -c "$PA_CONFIG_DIR" set "privacy_access.$section.group=$group" &&
+        uci -q -c "$PA_CONFIG_DIR" set "privacy_access.$section.enabled=$enabled" &&
+        uci -q -c "$PA_CONFIG_DIR" set "privacy_access.$section.owner=$owner" &&
+        uci -q -c "$PA_CONFIG_DIR" set "privacy_access.$section.hostname=$hostname" || {
+            uci -q -c "$PA_CONFIG_DIR" revert privacy_access
+            die 'Unable to save MAC permission'
+        }
+    fi
+    uci -q -c "$PA_CONFIG_DIR" commit privacy_access || {
+        uci -q -c "$PA_CONFIG_DIR" revert privacy_access
+        cp -p "$backup" "$PA_CONFIG_DIR/privacy_access"
+        die 'Unable to commit MAC permission'
+    }
+fi
+if ! "$PA_CLASSIFIER" --locked; then
+    if [ -n "$backup" ]; then
+        cp -p "$backup" "$PA_CONFIG_DIR/privacy_access"
+        uci -q -c "$PA_CONFIG_DIR" revert privacy_access
+        "$PA_CLASSIFIER" --locked >/dev/null 2>&1 || true
+    fi
+    die 'Unable to apply permission; saved configuration was restored'
+fi
+json_init
+json_add_boolean ok '1'
+json_add_string action "$action"
+[ -z "$mac" ] || json_add_string mac "$mac"
+json_dump

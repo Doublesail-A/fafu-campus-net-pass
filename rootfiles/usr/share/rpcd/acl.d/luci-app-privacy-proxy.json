@@ -1,0 +1,7 @@
+{
+  "luci-app-privacy-proxy": {
+    "description": "Manage the existing privacy proxy without replacing whitelist or CA policy",
+    "read": {"ubus": {"file": ["exec"]}, "file": {"/usr/sbin/privacy-proxy-status": ["exec"]}},
+    "write": {"ubus": {"file": ["exec"]}, "file": {"/usr/sbin/privacy-proxy": ["exec"], "/tmp/privacy-proxy/upload.*": ["write"]}}
+  }
+}

@@ -1,0 +1,88 @@
+#!/bin/sh /etc/rc.common
+USE_PROCD=1
+START=99
+STOP=10
+
+PROG="/usr/bin/sing-box"
+CONF="/etc/sing-box/privacy-iot.json"
+PROXY_PORT="7895"
+MARK="1"
+SERVER_IP_FILE="/etc/iot-proxy-server-ip"
+RUNTIME_DIR="/tmp/privacy-proxy"
+
+setup_nft() {
+    # Legacy table remains as an empty compatibility placeholder.
+    # Group routing and authorization are owned atomically by privacy_policy.
+    nft list table inet iot_proxy >/dev/null 2>&1 && nft delete table inet iot_proxy
+    nft -f - <<NFT
+table inet iot_proxy {
+    set iot_set { type ipv4_addr; flags interval; }
+}
+NFT
+    /etc/privacy-classify.sh
+}
+
+setup_egress_bypass() {
+    local i ip
+    [ -f "$SERVER_IP_FILE" ] || return 0
+    ip="$(head -1 "$SERVER_IP_FILE")"
+    [ -n "$ip" ] || return 0
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        nft list chain inet UA3F privacy_output >/dev/null 2>&1 && break
+        sleep 2
+    done
+    if nft list chain inet UA3F privacy_output >/dev/null 2>&1; then
+        nft list chain inet UA3F privacy_output 2>/dev/null | grep -q "ip daddr $ip " \
+            || nft insert rule inet UA3F privacy_output ip daddr "$ip" return comment iotproxy_egress 2>/dev/null || true
+    fi
+}
+
+setup_exclusions() {
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        nft list chain inet UA3F PREROUTING >/dev/null 2>&1 && break
+        sleep 2
+    done
+    if nft list chain inet UA3F PREROUTING >/dev/null 2>&1; then
+        nft list chain inet UA3F PREROUTING 2>/dev/null | grep -q 'iotproxy_bypass' \
+            || nft insert rule inet UA3F PREROUTING meta mark "$MARK" return comment iotproxy_bypass 2>/dev/null || true
+    fi
+    if nft list chain inet fw4 privacy_https_redirect >/dev/null 2>&1; then
+        nft list chain inet fw4 privacy_https_redirect 2>/dev/null | grep -q 'iotproxy_bypass' \
+            || nft insert rule inet fw4 privacy_https_redirect meta mark "$MARK" return comment iotproxy_bypass 2>/dev/null || true
+    fi
+}
+
+start_service() {
+    [ -x "$PROG" ] || return 0
+    [ -f "$CONF" ] || return 0
+
+    # /tmp is cleared on every boot. The core opens cache.db before exposing
+    # its listeners; never rely on a prior LuCI/status invocation to mkdir it.
+    umask 077
+    mkdir -p "$RUNTIME_DIR" || return 1
+    chmod 700 "$RUNTIME_DIR" || return 1
+    [ ! -f "$RUNTIME_DIR/cache.db" ] || chmod 600 "$RUNTIME_DIR/cache.db" || return 1
+
+    setup_nft
+    setup_egress_bypass
+    setup_exclusions
+
+    procd_open_instance "iot-proxy"
+    procd_set_param command "$PROG" run -c "$CONF"
+    procd_set_param respawn
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param limits nofile="65535 65535"
+    procd_set_param pidfile "/var/run/iot-proxy.pid"
+    procd_close_instance
+}
+
+stop_service() {
+    nft delete table inet iot_proxy 2>/dev/null || true
+}
+
+reload_service() {
+    stop
+    start
+}

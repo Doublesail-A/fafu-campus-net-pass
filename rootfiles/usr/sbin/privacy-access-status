@@ -1,0 +1,3 @@
+#!/bin/sh
+# A read-only RPC entry point: arguments cannot select a write operation.
+exec /usr/sbin/privacy-access list

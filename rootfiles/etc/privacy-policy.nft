@@ -1,0 +1,97 @@
+table inet privacy_policy {
+    set allowed_macs { type ether_addr; }
+    set normal_macs { type ether_addr; }
+    set iot_macs { type ether_addr; }
+    set temporary_proxy_macs { type ether_addr; flags timeout; }
+    chain rebuilt_tls_egress {
+        type route hook output priority -121; policy accept;
+        # Squid workers are the only processes using UID 65534 on this router.
+        # Their TLS sockets are already router-originated and need no HTTP UA
+        # parsing. Keep all WAN TTL/window/timestamp rules after this hook.
+        meta skuid 65534 tcp dport 443 meta mark 0x0 counter meta mark set 0xc9 comment "privacy: avoid duplicate UA3F relay for rebuilt Squid TLS"
+    }
+    chain iot_l4_guard {
+        meta l4proto != { tcp, udp } counter drop comment "privacy: IoT external traffic must use TCP proxy"
+        udp dport != { 53, 123 } counter drop comment "privacy: IoT UDP only permits router DNS and NTP interception"
+    }
+    chain prerouting_gate {
+        type filter hook prerouting priority -310; policy accept;
+        iifname != "br-lan" return
+        ip daddr { 255.255.255.255, 172.31.255.1 } udp sport 68 udp dport 67 return comment "privacy: DHCP discovery"
+        meta nfproto ipv4 ether saddr != @allowed_macs tcp dport { 53, 80 } return comment "privacy: unknown TCP only enters captive DNS or portal"
+        meta nfproto ipv4 ether saddr != @allowed_macs udp dport 53 return comment "privacy: unknown UDP only enters captive DNS"
+        tcp dport { 1080, 3129, 3130, 3131, 3132, 7894, 7895, 7896, 7897 } fib daddr type local counter drop comment "privacy: deny explicit proxy bypass"
+        ether saddr != @allowed_macs udp dport 53 fib daddr type local counter drop comment "privacy: unauthorized devices cannot use recursive DNS"
+        ether saddr != @allowed_macs tcp dport 53 fib daddr type local counter drop comment "privacy: unauthorized devices cannot use recursive DNS TCP"
+        # Classify the destination once, instead of repeating fib for each policy.
+        fib daddr type local return
+        fib daddr oifname "br-lan" return
+        ip daddr { 210.34.81.221, 59.79.224.57 } counter drop comment "privacy: preserve portal block before all proxy NAT"
+        ether saddr != @allowed_macs counter drop comment "privacy: deny unknown MAC before NAT on every uplink"
+        meta nfproto ipv6 counter drop comment "privacy: IPv6 internet disabled until certificate proxy supports it"
+        ether saddr @iot_macs jump iot_l4_guard
+        ether saddr @temporary_proxy_macs jump iot_l4_guard
+        udp dport 443 counter drop comment "privacy: prevent QUIC certificate bypass"
+    }
+    chain captive_redirect {
+        type nat hook prerouting priority -152; policy accept;
+        iifname != "br-lan" return
+        meta nfproto != ipv4 return
+        ether saddr @allowed_macs return
+        tcp dport 80 counter redirect to :8085 comment "privacy: captive HTTP, never WAN forwarding"
+        udp dport 53 counter redirect to :5354 comment "privacy: captive DNS only, no recursion"
+        tcp dport 53 counter redirect to :5354 comment "privacy: captive DNS TCP only, no recursion"
+    }
+    chain group_redirect {
+        type nat hook prerouting priority -151; policy accept;
+        iifname != "br-lan" return
+        meta nfproto != ipv4 return
+        ether saddr != @allowed_macs return
+        fib daddr type local return
+        fib daddr oifname "br-lan" return
+        udp dport 53 counter redirect to :53 comment "privacy: approved DNS stays on router"
+        tcp dport 53 counter redirect to :53 comment "privacy: approved DNS TCP stays on router"
+        udp dport 123 counter redirect to :123 comment "privacy: approved NTP stays on router"
+        ether saddr @temporary_proxy_macs tcp dport 443 counter meta mark set 0x1 redirect to :3131 comment "privacy: temporary end-to-end TLS relay"
+        ether saddr @temporary_proxy_macs tcp dport 80 counter meta mark set 0x1 redirect to :3132 comment "privacy: temporary HTTP retains Squid UA policy"
+        ether saddr @temporary_proxy_macs meta l4proto tcp counter meta mark set 0x1 redirect to :7894 comment "privacy: temporary non-web TCP proxy"
+        ether saddr @iot_macs meta l4proto tcp counter meta mark set 0x1 redirect to :7895 comment "privacy: IoT TCP relay to direct outbound"
+        ether saddr @normal_macs tcp dport 443 counter redirect to :3130 comment "privacy: normal end-to-end TLS relay"
+        ether saddr @normal_macs tcp dport 80 counter meta mark set 0x1 redirect to :3129 comment "privacy: normal HTTP UA and TCP relay"
+        ether saddr @normal_macs meta l4proto tcp counter meta mark set 0x1 redirect to :7897 comment "privacy: all other normal TCP rebuilt direct"
+    }
+    chain redirected_group_guard {
+        type filter hook prerouting priority -110; policy accept;
+        iifname != "br-lan" return
+        meta l4proto != tcp return
+        tcp dport != { 7894, 7895, 7897, 3129, 3130, 3131, 3132 } return
+        fib daddr type != local return
+        tcp dport { 7897, 3129 } ether saddr != @normal_macs counter drop comment "privacy: direct relay only for approved normal group"
+        tcp dport 7895 ether saddr @iot_macs return
+        tcp dport 7895 counter drop comment "privacy: revoke old IoT proxy connections after regrouping"
+        tcp dport 7894 ether saddr != @temporary_proxy_macs counter drop comment "privacy: revoke normal-device non-web proxy"
+        tcp dport { 3131, 3132 } ether saddr != @temporary_proxy_macs counter drop comment "privacy: temporary proxy expired or revoked"
+        tcp dport 3130 ether saddr != @normal_macs counter drop comment "privacy: revoke old certificate proxy connections after regrouping"
+    }
+    chain input_gate {
+        type filter hook input priority -10; policy accept;
+        iifname != "br-lan" return
+        tcp dport 7897 ether saddr != @normal_macs counter drop comment "privacy: direct relay final group guard"
+        tcp dport 7895 ether saddr @iot_macs return
+        tcp dport 7895 counter drop comment "privacy: final input gate for IoT proxy"
+        tcp dport 7894 ether saddr != @temporary_proxy_macs counter drop comment "privacy: final normal-device non-web proxy gate"
+        tcp dport { 3131, 3132 } ether saddr != @temporary_proxy_macs counter drop comment "privacy: final input gate for temporary certificate proxy"
+        tcp dport { 3129, 3130 } ether saddr != @normal_macs counter drop comment "privacy: final input gate for certificate proxy"
+        tcp dport 1080 ether saddr != @allowed_macs counter drop comment "privacy: revoke established UA3F connections"
+        udp dport 53 ether saddr != @allowed_macs counter drop comment "privacy: no old recursive DNS binding for unknown MAC"
+        tcp dport 53 ether saddr != @allowed_macs counter drop comment "privacy: no old recursive DNS TCP binding for unknown MAC"
+    }
+    chain forward_gate {
+        type filter hook forward priority -19; policy accept;
+        iifname != "br-lan" return
+        oifname "br-lan" return
+        ether saddr != @allowed_macs counter drop comment "privacy: fail closed for unauthorized forwarding"
+        ether saddr @iot_macs counter drop comment "privacy: IoT must not forward around proxy"
+        meta l4proto tcp ether saddr @normal_macs counter drop comment "privacy: fail closed for old unrelayed normal TCP"
+    }
+}

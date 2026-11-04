@@ -1,0 +1,8 @@
+{
+  "admin/network/privacy_proxy": {
+    "title": "代理与临时分流",
+    "order": 66,
+    "action": {"type": "view", "path": "network/privacy-proxy-20261102d"},
+    "depends": {"acl": ["luci-app-privacy-proxy"]}
+  }
+}

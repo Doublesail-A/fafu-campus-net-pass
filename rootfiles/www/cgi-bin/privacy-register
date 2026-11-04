@@ -1,0 +1,77 @@
+#!/bin/sh
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+export PATH
+umask 077
+unset UCI_CONFIG_DIR PA_LIBRARY PA_CLASSIFIER PA_LEASES PA_REG_SECRET PA_REG_LAST PA_REG_RUNTIME PA_REG_LOCK
+. /usr/share/privacy-access/common.sh
+. /usr/share/privacy-access/registration.sh
+. /usr/share/libubox/jshn.sh
+registration_locked=0
+release_registration_lock() {
+    [ "$registration_locked" = '1' ] || return 0
+    flock -u 9
+    exec 9>&-
+    registration_locked=0
+}
+reply() {
+    local status="$1" message="$2" ok="${3:-0}"
+    release_registration_lock
+    printf 'Status: %s\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n' "$status"
+    json_init; json_add_boolean ok "$ok"; json_add_string message "$message"; json_dump
+    exit 0
+}
+case "${HTTP_HOST:-}" in 172.31.255.1|172.31.255.1:80|172.31.255.1:8085) ;; *) reply '403 Forbidden' '请从路由器的注册页面访问。' ;; esac
+case "${HTTP_ORIGIN:-}" in ''|http://172.31.255.1|http://172.31.255.1:8085) ;; *) reply '403 Forbidden' '请求来源无效。' ;; esac
+ip="${REMOTE_ADDR:-}"
+[ "$(printf '%s\n' "$ip" | pa_ipv4_list)" = "$ip" ] && [ "$ip" != '172.31.255.1' ] || reply '403 Forbidden' '仅允许局域网设备注册。'
+ip -4 route get "$ip" 2>/dev/null | grep -q 'dev br-lan' || reply '403 Forbidden' '仅允许局域网设备注册。'
+mac="$(ip -4 neigh show to "$ip" dev br-lan | awk '{for(i=1;i<=NF;i++)if($i=="lladdr"){print tolower($(i+1));exit}}')"
+pa_valid_mac "$mac" || reply '409 Conflict' '无法识别本机 MAC，请重新连接网络后重试。'
+hostname="$(pa_mac_hostname "$mac")"
+allowed=0; enabled=0; physical=1
+ca_required=1
+grep -qx 'tls-passthrough-v1' /etc/privacy-transport-mode 2>/dev/null && ca_required=0
+nft get element inet privacy_policy allowed_macs "{ $mac }" >/dev/null 2>&1 && allowed=1
+pa_reg_enabled && enabled=1
+[ "$((0x${mac%%:*} & 2))" -eq 0 ] || physical=0
+[ -s "$PA_REG_SECRET" ] || reply '503 Service Unavailable' '注册尚未配置，请联系管理员。'
+if [ "${REQUEST_METHOD:-GET}" = GET ]; then
+    printf 'Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n'
+    json_init; json_add_boolean ok 1
+    json_add_string mac "$mac"; json_add_string ip "$ip"; json_add_string hostname "$hostname"
+    json_add_boolean allowed "$allowed"; json_add_boolean enabled "$enabled"; json_add_boolean physical_mac "$physical"
+    json_add_boolean ca_required "$ca_required"
+    json_add_string token "$(pa_reg_token "$mac" "$ip" "$(($(date +%s) / 600))")"
+    json_dump; exit 0
+fi
+[ "${REQUEST_METHOD:-}" = POST ] || reply '405 Method Not Allowed' '请求方法无效。'
+[ "$enabled" = 1 ] || reply '403 Forbidden' '管理员暂时关闭了自助注册。'
+[ "$allowed" = 0 ] || reply '200 OK' '本机已经获得上网授权。' 1
+case "${CONTENT_LENGTH:-}" in ''|*[!0-9]*) reply '400 Bad Request' '请求格式无效。' ;; esac
+[ "$CONTENT_LENGTH" -le 2048 ] || reply '413 Content Too Large' '请求过大。'
+json_load "$(head -c "$CONTENT_LENGTH")" || reply '400 Bad Request' '请求格式无效。'
+json_get_var otp otp; json_get_var token token; json_get_var remark remark
+[ "${#remark}" -le 80 ] || reply '400 Bad Request' '备注最多 80 个字符。'
+pa_reg_check_token "$token" "$mac" "$ip" || reply '403 Forbidden' '页面已过期，请刷新后重试。'
+# Descriptor locks do not leave a signal-dependent holder behind under uWSGI.
+exec 9>>"$PA_REG_LOCK"
+flock -n 9 || reply '503 Service Unavailable' '系统繁忙，请稍后重试。'
+registration_locked=1
+trap release_registration_lock EXIT
+trap 'exit 1' HUP INT TERM
+pa_reg_enabled || reply '403 Forbidden' '管理员暂时关闭了自助注册。'
+id="$(printf '%s' "$mac" | tr -d ':')"
+pa_reg_rate_check "$id" || reply '429 Too Many Requests' '尝试过于频繁，请 5 分钟后重试或联系管理员。'
+if ! pa_reg_verify "$otp"; then
+    pa_reg_rate_fail "$id"
+    reply '403 Forbidden' '验证码无效、已使用或已过期。请使用认证器的下一个动态码。'
+fi
+previous_step=''
+[ ! -f "$PA_REG_LAST" ] || previous_step="$(cat "$PA_REG_LAST")"
+(umask 077; printf '%s\n' "$PA_REG_ACCEPTED_STEP" > "$PA_REG_LAST.new") && mv "$PA_REG_LAST.new" "$PA_REG_LAST" || reply '503 Service Unavailable' '无法保存验证码状态，请联系管理员。'
+if ! /usr/sbin/privacy-access add "$mac" "$remark" normal 1 "$hostname" 9>&- >/dev/null 2>&1; then
+    if [ -n "$previous_step" ]; then printf '%s\n' "$previous_step" > "$PA_REG_LAST"; else rm -f "$PA_REG_LAST"; fi
+    reply '503 Service Unavailable' '授权未能应用，请联系管理员。'
+fi
+logger -t privacy-registration "Registered MAC $mac as normal client"
+reply '200 OK' '注册成功。本机已加入普通设备组，请关闭此登录窗口并重新打开网站。' 1

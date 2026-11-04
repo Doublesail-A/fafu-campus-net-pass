@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>设备上网注册</title>
+<style>
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;padding:24px 16px;color:#111;background:#fff;font:16px/1.6 system-ui,sans-serif}
+main{max-width:32rem;margin:0 auto}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;margin:0 0 16px}
+details{margin:12px 0 24px}
+summary,a,button{touch-action:manipulation}
+summary{cursor:pointer}
+form p{margin:0 0 20px}
+input[type=text]{display:block;width:100%;min-height:46px;margin-top:6px;padding:8px 10px;font:inherit}
+#otp{font-variant-numeric:tabular-nums;letter-spacing:.15em}
+.check{display:flex;align-items:flex-start;gap:10px;margin:18px 0;cursor:pointer}
+.check input{flex:none;width:20px;height:20px;margin:3px 0 0}
+button{min-height:46px;width:100%;padding:8px 18px;font:inherit;cursor:pointer}
+button:disabled{cursor:default}
+#message{margin:18px 0;overflow-wrap:anywhere}
+.error{color:#a40000}.success{color:#12621e}
+footer{margin-top:24px;font-size:14px;color:#555}
+.ca-download{margin:16px 0 20px}.ca-download p{margin:8px 0}.ca-download button{margin-top:8px}.hint{font-size:14px;color:#555}
+@media(min-width:600px){body{padding-top:40px}}
+</style>
+</head><body><main>
+
+<pre id="device">正在识别本机…</pre>
+<form id="form">
+
+<p><label for="otp">6 位动态验证码</label><input id="otp" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autocomplete="one-time-code" autocapitalize="off" spellcheck="false" placeholder="000000"></p>
+<button id="submit" type="submit" disabled>注册本机</button>
+</form><div id="message" role="status"></div>
+<footer><p><a href="/">刷新本机状态</a></p></footer>
+</main><script>
+(function(){
+  'use strict';
+  var context=null, button=document.getElementById('submit'), message=document.getElementById('message');
+  function show(text,ok){message.textContent=text;message.className=ok?'success':'error'}
+  fetch('/cgi-bin/privacy-register',{cache:'no-store',credentials:'same-origin'}).then(function(r){return r.json()}).then(function(data){
+    if(!data.ok)throw new Error(data.message||'无法识别设备');
+    context=data;
+    document.getElementById('device').textContent='设备名称：'+(data.hostname||'设备未提供名称')+'\nMAC：'+data.mac+'\nIP：'+data.ip;
+    if(data.allowed){document.getElementById('form').hidden=true;show('本机已获得上网授权。请关闭此窗口并打开网站。',true)}
+    else if(!data.enabled)show('管理员暂时关闭了自助注册，请联系管理员。');
+    else button.disabled=false;
+  }).catch(function(e){show(e.message)});
+  document.getElementById('form').addEventListener('submit',function(event){
+    event.preventDefault();if(!context||button.disabled)return;
+    button.disabled=true;show('正在申请授权…',true);
+    fetch('/cgi-bin/privacy-register',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      otp:document.getElementById('otp').value.trim(),token:context.token
+    })}).then(function(r){return r.json()}).then(function(data){show(data.message,!!data.ok);if(data.ok)document.getElementById('form').hidden=true;else button.disabled=false}).catch(function(e){show('请求失败，请刷新后重试。');button.disabled=false});
+  });
+})();
+</script></body></html>

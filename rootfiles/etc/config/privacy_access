@@ -1,0 +1,4 @@
+config settings 'main'
+    option schema '2'
+
+# Devices are added by the LuCI page or /usr/sbin/privacy-access.

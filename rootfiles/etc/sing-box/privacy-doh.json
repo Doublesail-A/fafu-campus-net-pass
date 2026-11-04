@@ -1,0 +1,18 @@
+{
+  "log": {"level": "warn"},
+  "dns": {
+    "servers": [
+      {"type": "https", "tag": "encrypted", "server": "dns.alidns.com", "server_port": 443, "path": "/dns-query", "domain_resolver": "bootstrap"},
+      {"type": "udp", "tag": "bootstrap", "server": "223.5.5.5"}
+    ],
+    "strategy": "ipv4_only",
+    "cache_capacity": 4096
+  },
+  "inbounds": [{"type": "direct", "tag": "dns-in", "listen": "127.0.0.1", "listen_port": 5353}],
+  "outbounds": [{"type": "direct", "tag": "direct", "routing_mark": 201}],
+  "route": {
+    "default_domain_resolver": "bootstrap",
+    "rules": [{"action": "sniff", "sniffer": ["dns"]}, {"protocol": "dns", "action": "hijack-dns"}],
+    "final": "direct"
+  }
+}

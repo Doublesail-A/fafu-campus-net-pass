@@ -1,0 +1,8 @@
+{
+  "admin/network/privacy_access": {
+    "title": "设备上网白名单",
+    "order": 65,
+    "action": { "type": "view", "path": "network/privacy-access-20261102d" },
+    "depends": { "acl": ["luci-app-privacy-access"] }
+  }
+}

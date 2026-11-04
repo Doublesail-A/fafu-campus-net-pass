@@ -1,0 +1,10 @@
+#!/bin/sh
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+unset LUA_PATH LUA_CPATH UCI_CONFIG_DIR PA_LIBRARY PA_TEMP_PROXY_FILE
+mkdir -p /tmp/privacy-proxy
+chmod 700 /tmp/privacy-proxy
+exec 9>>/tmp/privacy-proxy/manager.lock
+flock -x 9 || exit 1
+exec /usr/bin/env -i PATH="$PATH" /usr/bin/lua /usr/share/privacy-access/proxy.lua "$@"

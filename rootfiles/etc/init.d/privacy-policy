@@ -1,0 +1,24 @@
+#!/bin/sh /etc/rc.common
+START=18
+STOP=11
+start() {
+    /etc/privacy-classify.sh --replace && return 0
+    # A bad configuration at boot must not leave LAN->WAN open.
+    local batch result
+    batch="$(mktemp /tmp/privacy-policy-deny.XXXXXX)" || return 1
+    nft list table inet privacy_policy >/dev/null 2>&1 && printf 'delete table inet privacy_policy\n' >> "$batch"
+    cat /etc/privacy-policy.nft >> "$batch"
+    nft -f "$batch"
+    result="$?"
+    rm -f "$batch"
+    if [ "$result" -eq 0 ]; then
+        logger -t privacy-policy 'Configuration apply failed; installed empty fail-closed whitelist'
+    else
+        logger -p daemon.err -t privacy-policy 'CRITICAL: unable to install fail-closed whitelist'
+    fi
+    return "$result"
+}
+reload() { start; }
+# A restart must not temporarily remove enforcement.
+restart() { start; }
+stop() { nft delete table inet privacy_policy 2>/dev/null; }
