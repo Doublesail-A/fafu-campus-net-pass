@@ -39,8 +39,5 @@
 
 **感谢 [YifanHere/campus-net-nat-bypass](https://github.com/YifanHere/campus-net-nat-bypass/)** 对校园网认证、全 TCP 重新发起、DNS/IPv6 一致性、门户访问边界、掉线恢复及抓包验证的整理。该项目帮助本方案重新评估 MITM 的必要性，并确定“保留 TCP 重建、恢复端到端 TLS”的方向。
 
-本仓库采用 nftables、Squid splice、sing-box 和 LuCI 实现自身管理流程，并未直接照搬对方的账户参数、限流阈值或认证状态机。参考项目对特定校园网检测机制的判断，与本仓库可复现的验证结果分别看待。详细说明见 [致谢与第三方组件](docs/ACKNOWLEDGEMENTS.md)。
+本仓库采用 nftables、Squid splice、sing-box 和 LuCI 实现自身管理流程。
 
-## 数据说明
-
-仓库没有真实订阅 URL、节点密码、TOTP 密钥、CA 私钥、校园账户、真实设备列表、原始抓包或浏览器 cookies。运行时数据留在路由器上；备份包含敏感数据，应自行妥善保管，不要提交到 Git。
